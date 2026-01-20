@@ -21,8 +21,17 @@ import sys
 import importlib.util
 from safetensors.torch import load_file
 import cv2
+import time
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Device detection with M1/M2/M3 Mac support
+if torch.cuda.is_available():
+    device = "cuda"
+elif torch.backends.mps.is_available():
+    device = "mps"
+    print("[BiRefNet] Using Metal Performance Shaders (MPS) for GPU acceleration on Apple Silicon")
+else:
+    device = "cpu"
+    print("[BiRefNet] WARNING: Running on CPU, this will be slow!")
 
 # Add model path
 folder_paths.add_model_folder_path("rmbg", os.path.join(folder_paths.models_dir, "RMBG"))
@@ -201,37 +210,37 @@ def refine_foreground(image_bchw, masks_b1hw):
     b, c, h, w = image_bchw.shape
     if b != masks_b1hw.shape[0]:
         raise ValueError("images and masks must have the same batch size")
-    
+
     image_np = image_bchw.cpu().numpy()
     mask_np = masks_b1hw.cpu().numpy()
-    
+
     refined_fg = []
     for i in range(b):
-        mask = mask_np[i, 0]      
+        mask = mask_np[i, 0]
         thresh = 0.45
         mask_binary = (mask > thresh).astype(np.float32)
-        
+
         edge_blur = cv2.GaussianBlur(mask_binary, (3, 3), 0)
         transition_mask = np.logical_and(mask > 0.05, mask < 0.95)
-        
+
         alpha = 0.85
         mask_refined = np.where(transition_mask,
                               alpha * mask + (1-alpha) * edge_blur,
                               mask_binary)
-        
+
         edge_region = np.logical_and(mask > 0.2, mask < 0.8)
         mask_refined = np.where(edge_region,
                               mask_refined * 0.98,
                               mask_refined)
-        
+
         result = []
         for c in range(image_np.shape[1]):
             channel = image_np[i, c]
             refined = channel * mask_refined
             result.append(refined)
-            
+
         refined_fg.append(np.stack(result))
-    
+
     return torch.from_numpy(np.stack(refined_fg))
 
 class BiRefNetModel:
@@ -239,33 +248,33 @@ class BiRefNetModel:
         self.model = None
         self.current_model_version = None
         self.base_cache_dir = os.path.join(folder_paths.models_dir, "RMBG")
-    
+
     def get_cache_dir(self, model_name):
         return os.path.join(self.base_cache_dir, MODEL_CONFIG[model_name]["cache_dir"])
-    
+
     def check_model_cache(self, model_name):
         cache_dir = self.get_cache_dir(model_name)
-        
+
         if not os.path.exists(cache_dir):
             return False, "Model directory not found"
-        
+
         missing_files = []
         for filename in MODEL_CONFIG[model_name]["files"].keys():
             if not os.path.exists(os.path.join(cache_dir, filename)):
                 missing_files.append(filename)
-        
+
         if missing_files:
             return False, f"Missing model files: {', '.join(missing_files)}"
-            
+
         return True, "Model cache verified"
-    
+
     def download_model(self, model_name):
         cache_dir = self.get_cache_dir(model_name)
-        
+
         try:
             os.makedirs(cache_dir, exist_ok=True)
             print(f"Downloading {model_name} model files...")
-            
+
             for filename in MODEL_CONFIG[model_name]["files"].keys():
                 print(f"Downloading {filename}...")
                 hf_hub_download(
@@ -274,12 +283,12 @@ class BiRefNetModel:
                     local_dir=cache_dir,
                     local_dir_use_symlinks=False
                 )
-                    
+
             return True, "Model files downloaded successfully"
-            
+
         except Exception as e:
             return False, f"Error downloading model files: {str(e)}"
-    
+
     def clear_model(self):
         if self.model is not None:
             self.model.cpu()
@@ -291,15 +300,17 @@ class BiRefNetModel:
 
     def load_model(self, model_name):
         if self.current_model_version != model_name:
+            print(f"[BiRefNet] Loading model {model_name}...")
+            load_start = time.time()
             self.clear_model()
-            
+
             cache_dir = self.get_cache_dir(model_name)
             model_filename = [k for k in MODEL_CONFIG[model_name]["files"].keys() if k.endswith('.py') and k != "BiRefNet_config.py"][0]
             model_path = os.path.join(cache_dir, model_filename)
             config_path = os.path.join(cache_dir, "BiRefNet_config.py")
             weights_filename = [k for k in MODEL_CONFIG[model_name]["files"].keys() if k.endswith('.safetensors')][0]
             weights_path = os.path.join(cache_dir, weights_filename)
-            
+
             try:
                 # Fix relative imports in model file
                 with open(model_path, 'r', encoding='utf-8') as f:
@@ -307,70 +318,78 @@ class BiRefNetModel:
                 model_content = model_content.replace("from .BiRefNet_config", "from BiRefNet_config")
                 with open(model_path, 'w', encoding='utf-8') as f:
                     f.write(model_content)
-                
+
                 # Load config and model dynamically
                 spec = importlib.util.spec_from_file_location("BiRefNet_config", config_path)
                 config_module = importlib.util.module_from_spec(spec)
                 sys.modules["BiRefNet_config"] = config_module
                 spec.loader.exec_module(config_module)
-                
+
                 spec = importlib.util.spec_from_file_location("birefnet", model_path)
                 model_module = importlib.util.module_from_spec(spec)
                 sys.modules["birefnet"] = model_module
                 spec.loader.exec_module(model_module)
-                
+
                 # Initialize model
                 self.model = model_module.BiRefNet(config_module.BiRefNetConfig())
-                
+
                 # Load weights
                 state_dict = load_file(weights_path)
                 self.model.load_state_dict(state_dict)
-                
+
                 self.model.eval()
                 self.model.half()
                 torch.set_float32_matmul_precision('high')
                 self.model.to(device)
                 self.current_model_version = model_name
-                
+                print(f"[BiRefNet] Model loaded in {time.time() - load_start:.2f}s")
+
             except Exception as e:
                 handle_model_error(f"Error loading BiRefNet model: {str(e)}")
 
     def process_image(self, image, params):
         try:
+            print(f"[BiRefNet] Starting image preprocessing...")
+            preprocess_start = time.time()
             transform_image = transforms.Compose([
-                transforms.Resize((params["process_res"], params["process_res"]), 
+                transforms.Resize((params["process_res"], params["process_res"]),
                                 interpolation=transforms.InterpolationMode.BICUBIC),
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
             ])
-            
+
             orig_image = tensor2pil(image)
             w, h = orig_image.size
-            
+
             input_tensor = transform_image(orig_image).unsqueeze(0).to(device).half()
-            
+            print(f"[BiRefNet] Image preprocessing completed in {time.time() - preprocess_start:.2f}s")
+
             with torch.no_grad():
                 preds = self.model(input_tensor)
                 pred = preds[-1].sigmoid().cpu()
-            
+
+            print(f"[BiRefNet] Post-processing mask...")
+            postprocess_start = time.time()
             pred = pred[0].squeeze()
             pred_pil = transforms.ToPILImage()(pred)
             mask = pred_pil.resize((w, h), Image.BICUBIC)
-            
+            print(f"[BiRefNet] Mask post-processing completed in {time.time() - postprocess_start:.2f}s")
+
             return mask
-            
+
         except Exception as e:
             handle_model_error(f"Error in BiRefNet processing: {str(e)}")
 
 class BiRefNetRMBG:
     def __init__(self):
         self.model = BiRefNetModel()
-    
+
     @classmethod
     def INPUT_TYPES(s):
         tooltips = {
             "image": "Input image to be processed for background removal.",
             "model": "Select the BiRefNet model variant to use.",
+            "process_resolution": "Override processing resolution for memory optimization (0 = use model default). Lower values use less memory.",
             "mask_blur": "Specify the amount of blur to apply to the mask edges (0 for no blur, higher values for more blur).",
             "mask_offset": "Adjust the mask boundary (positive values expand the mask, negative values shrink it).",
             "invert_output": "Enable to invert both the image and mask output (useful for certain effects).",
@@ -384,6 +403,7 @@ class BiRefNetRMBG:
                 "model": (list(MODEL_CONFIG.keys()), {"tooltip": tooltips["model"]}),
             },
             "optional": {
+                "process_resolution": ("INT", {"default": 0, "min": 0, "max": 2560, "step": 32, "tooltip": tooltips["process_resolution"]}),
                 "mask_blur": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1, "tooltip": tooltips["mask_blur"]}),
                 "mask_offset": ("INT", {"default": 0, "min": -20, "max": 20, "step": 1, "tooltip": tooltips["mask_offset"]}),
                 "invert_output": ("BOOLEAN", {"default": False, "tooltip": tooltips["invert_output"]}),
@@ -401,12 +421,18 @@ class BiRefNetRMBG:
     def process_image(self, image, model, **params):
         try:
             model_config = MODEL_CONFIG[model]
-            process_res = model_config.get("default_res", 1024)
-            if model_config.get("force_res", False):
-                base_res = 512
-                process_res = ((process_res + base_res - 1) // base_res) * base_res
+
+            # Allow manual resolution override for memory optimization
+            if params.get("process_resolution", 0) > 0:
+                process_res = params["process_resolution"]
+                process_res = process_res // 32 * 32  # Ensure divisible by 32
             else:
-                process_res = process_res // 32 * 32
+                process_res = model_config.get("default_res", 1024)
+                if model_config.get("force_res", False):
+                    base_res = 512
+                    process_res = ((process_res + base_res - 1) // base_res) * base_res
+                else:
+                    process_res = process_res // 32 * 32
             print(f"Using {model} model with {process_res} resolution")
             params["process_res"] = process_res
             processed_images = []
@@ -420,23 +446,36 @@ class BiRefNetRMBG:
                     handle_model_error(download_message)
                 print("Model files downloaded successfully")
             self.model.load_model(model)
-            for img in image:
+            print(f"[BiRefNet] Processing {len(image)} image(s)...")
+            total_start = time.time()
+            for idx, img in enumerate(image):
+                print(f"[BiRefNet] === Processing image {idx + 1}/{len(image)} ===")
+                img_start = time.time()
                 mask = self.model.process_image(img, params)
                 if params["mask_blur"] > 0:
+                    print(f"[BiRefNet] Applying mask blur...")
+                    blur_start = time.time()
                     mask = mask.filter(ImageFilter.GaussianBlur(radius=params["mask_blur"]))
+                    print(f"[BiRefNet] Mask blur completed in {time.time() - blur_start:.2f}s")
                 if params["mask_offset"] != 0:
+                    print(f"[BiRefNet] Applying mask offset...")
+                    offset_start = time.time()
                     if params["mask_offset"] > 0:
                         for _ in range(params["mask_offset"]):
                             mask = mask.filter(ImageFilter.MaxFilter(3))
                     else:
                         for _ in range(-params["mask_offset"]):
                             mask = mask.filter(ImageFilter.MinFilter(3))
+                    print(f"[BiRefNet] Mask offset completed in {time.time() - offset_start:.2f}s")
                 if params["invert_output"]:
                     mask = Image.fromarray(255 - np.array(mask))
                 img_tensor = torch.from_numpy(np.array(tensor2pil(img))).permute(2, 0, 1).unsqueeze(0) / 255.0
                 mask_tensor = torch.from_numpy(np.array(mask)).unsqueeze(0).unsqueeze(0) / 255.0
                 if params.get("refine_foreground", False):
+                    print(f"[BiRefNet] Refining foreground...")
+                    refine_start = time.time()
                     refined_fg = refine_foreground(img_tensor, mask_tensor)
+                    print(f"[BiRefNet] Foreground refinement completed in {time.time() - refine_start:.2f}s")
                     refined_fg = tensor2pil(refined_fg[0].permute(1, 2, 0))
                     orig_image = tensor2pil(img)
                     r, g, b = refined_fg.split()
@@ -465,6 +504,9 @@ class BiRefNetRMBG:
                     composite_image = Image.alpha_composite(bg_image, foreground)
                     processed_images.append(pil2tensor(composite_image.convert("RGB")))
                 processed_masks.append(pil2tensor(mask))
+                print(f"[BiRefNet] Image {idx + 1} completed in {time.time() - img_start:.2f}s")
+            print(f"[BiRefNet] Total processing time: {time.time() - total_start:.2f}s")
+            print(f"[BiRefNet] Creating mask image outputs...")
             mask_images = []
             for mask_tensor in processed_masks:
                 mask_image = mask_tensor.reshape((-1, 1, mask_tensor.shape[-2], mask_tensor.shape[-1])).movedim(1, -1).expand(-1, -1, -1, 3)
