@@ -20,3 +20,6 @@ transformers
 # ftfy
 # typing_extensions
 #triton-windows
+
+# fix
+timm
