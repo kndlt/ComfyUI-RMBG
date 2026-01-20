@@ -1,14 +1,14 @@
 # Base dependencies
 huggingface-hub
-transparent-background
+# transparent-background
 # segment-anything
-groundingdino-py
-opencv-python
-onnxruntime
-onnxruntime-gpu
-protobuf
+# groundingdino-py
+# opencv-python
+# onnxruntime
+# onnxruntime-gpu
+# protobuf
 transformers
-diffusers
+# diffusers
 
 # #SAM2
 # hydra-core
