@@ -18,7 +18,6 @@ import numpy as np
 import folder_paths
 from huggingface_hub import hf_hub_download
 import sys
-from comfy.utils import ProgressBar
 import importlib.util
 from safetensors.torch import load_file
 import cv2
@@ -348,10 +347,8 @@ class BiRefNetModel:
             except Exception as e:
                 handle_model_error(f"Error loading BiRefNet model: {str(e)}")
 
-    def process_image(self, image, params, pbar=None, step=0):
+    def process_image(self, image, params):
         try:
-            if pbar:
-                pbar.update_absolute(step, desc="Preprocessing image")
             print(f"[BiRefNet] Starting image preprocessing...")
             preprocess_start = time.time()
             transform_image = transforms.Compose([
@@ -364,11 +361,13 @@ class BiRefNetModel:
             orig_image = tensor2pil(image)
             w, h = orig_image.size
 
+            # Convert to RGB to ensure 3 channels (remove alpha if present)
+            if orig_image.mode != 'RGB':
+                orig_image = orig_image.convert('RGB')
+
             input_tensor = transform_image(orig_image).unsqueeze(0).to(device).half()
             print(f"[BiRefNet] Image preprocessing completed in {time.time() - preprocess_start:.2f}s")
 
-            if pbar:
-                pbar.update_absolute(step + 1, desc="Running inference")
             print(f"[BiRefNet] Running model inference...")
             inference_start = time.time()
             with torch.no_grad():
@@ -457,13 +456,10 @@ class BiRefNetRMBG:
             print(f"[BiRefNet] Processing {len(image)} image(s)...")
             total_start = time.time()
 
-            # Initialize progress bar: 3 steps per image (preprocess, inference, postprocess)
-            pbar = ProgressBar(len(image) * 3)
-
             for idx, img in enumerate(image):
                 print(f"[BiRefNet] === Processing image {idx + 1}/{len(image)} ===")
                 img_start = time.time()
-                mask = self.model.process_image(img, params, pbar=pbar, step=idx * 3)
+                mask = self.model.process_image(img, params)
                 if params["mask_blur"] > 0:
                     print(f"[BiRefNet] Applying mask blur...")
                     blur_start = time.time()
@@ -490,6 +486,9 @@ class BiRefNetRMBG:
                     print(f"[BiRefNet] Foreground refinement completed in {time.time() - refine_start:.2f}s")
                     refined_fg = tensor2pil(refined_fg[0].permute(1, 2, 0))
                     orig_image = tensor2pil(img)
+                    # Ensure refined_fg is RGB before splitting
+                    if refined_fg.mode == 'RGBA':
+                        refined_fg = refined_fg.convert('RGB')
                     r, g, b = refined_fg.split()
                     foreground = Image.merge('RGBA', (r, g, b, mask))
                 else:
