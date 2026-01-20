@@ -18,6 +18,7 @@ import numpy as np
 import folder_paths
 from huggingface_hub import hf_hub_download
 import sys
+from comfy.utils import ProgressBar
 import importlib.util
 from safetensors.torch import load_file
 import cv2
@@ -347,8 +348,10 @@ class BiRefNetModel:
             except Exception as e:
                 handle_model_error(f"Error loading BiRefNet model: {str(e)}")
 
-    def process_image(self, image, params):
+    def process_image(self, image, params, pbar=None, step=0):
         try:
+            if pbar:
+                pbar.update_absolute(step, desc="Preprocessing image")
             print(f"[BiRefNet] Starting image preprocessing...")
             preprocess_start = time.time()
             transform_image = transforms.Compose([
@@ -364,9 +367,14 @@ class BiRefNetModel:
             input_tensor = transform_image(orig_image).unsqueeze(0).to(device).half()
             print(f"[BiRefNet] Image preprocessing completed in {time.time() - preprocess_start:.2f}s")
 
+            if pbar:
+                pbar.update_absolute(step + 1, desc="Running inference")
+            print(f"[BiRefNet] Running model inference...")
+            inference_start = time.time()
             with torch.no_grad():
                 preds = self.model(input_tensor)
                 pred = preds[-1].sigmoid().cpu()
+            print(f"[BiRefNet] Model inference completed in {time.time() - inference_start:.2f}s")
 
             print(f"[BiRefNet] Post-processing mask...")
             postprocess_start = time.time()
@@ -448,10 +456,14 @@ class BiRefNetRMBG:
             self.model.load_model(model)
             print(f"[BiRefNet] Processing {len(image)} image(s)...")
             total_start = time.time()
+
+            # Initialize progress bar: 3 steps per image (preprocess, inference, postprocess)
+            pbar = ProgressBar(len(image) * 3)
+
             for idx, img in enumerate(image):
                 print(f"[BiRefNet] === Processing image {idx + 1}/{len(image)} ===")
                 img_start = time.time()
-                mask = self.model.process_image(img, params)
+                mask = self.model.process_image(img, params, pbar=pbar, step=idx * 3)
                 if params["mask_blur"] > 0:
                     print(f"[BiRefNet] Applying mask blur...")
                     blur_start = time.time()
